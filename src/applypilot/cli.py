@@ -380,10 +380,19 @@ def doctor() -> None:
 
     # --- Tier 2 checks ---
     import os
+    provider = os.environ.get("LLM_PROVIDER", "").strip().lower().replace("_", "-")
+    uses_claude_llm = provider in ("claude-cli", "claude", "claude-code", "anthropic-cli")
     has_gemini = bool(os.environ.get("GEMINI_API_KEY"))
     has_openai = bool(os.environ.get("OPENAI_API_KEY"))
     has_local = bool(os.environ.get("LLM_URL"))
-    if has_gemini:
+    if uses_claude_llm:
+        if shutil.which("claude"):
+            model = os.environ.get("LLM_MODEL", "sonnet")
+            results.append(("LLM provider", ok_mark, f"Claude CLI subscription ({model})"))
+        else:
+            results.append(("LLM provider", fail_mark,
+                            "LLM_PROVIDER=claude-cli but 'claude' not on PATH — install + run 'claude login'"))
+    elif has_gemini:
         model = os.environ.get("LLM_MODEL", "gemini-2.0-flash")
         results.append(("LLM API key", ok_mark, f"Gemini ({model})"))
     elif has_openai:
@@ -393,7 +402,7 @@ def doctor() -> None:
         results.append(("LLM API key", ok_mark, f"Local: {os.environ.get('LLM_URL')}"))
     else:
         results.append(("LLM API key", fail_mark,
-                        "Set GEMINI_API_KEY in ~/.applypilot/.env (run 'applypilot init')"))
+                        "Set GEMINI_API_KEY (or LLM_PROVIDER=claude-cli) in ~/.applypilot/.env (run 'applypilot init')"))
 
     # --- Tier 3 checks ---
     # Claude Code CLI

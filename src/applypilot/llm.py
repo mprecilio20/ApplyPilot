@@ -6,11 +6,19 @@ Auto-detects provider from environment:
   OPENAI_API_KEY  -> OpenAI (default: gpt-4o-mini)
   LLM_URL         -> Local llama.cpp / Ollama compatible endpoint
 
+Set LLM_PROVIDER=claude-cli to route calls through the Claude Code CLI
+instead of an HTTP API. This reuses your logged-in Anthropic subscription
+(Pro/Max OAuth) for billing -- no API key required. Run `claude login`
+once, then set LLM_PROVIDER=claude-cli (default model: sonnet).
+
 LLM_MODEL env var overrides the model name for any provider.
 """
 
+import json
 import logging
 import os
+import shutil
+import subprocess
 import time
 
 import httpx
@@ -281,17 +289,220 @@ class _GeminiCompatForbidden(Exception):
 
 
 # ---------------------------------------------------------------------------
+# Claude Code CLI client (subscription auth, no API key)
+# ---------------------------------------------------------------------------
+
+_CLAUDE_CLI_TIMEOUT = 300  # seconds; CLI can be slow on cold start
+_CLAUDE_CLI_MAX_RETRIES = 3
+_CLAUDE_CLI_BASE_WAIT = 5
+
+
+class ClaudeCLIClient:
+    """LLM client that shells out to the `claude` CLI.
+
+    This reuses the user's logged-in Anthropic subscription (Pro/Max OAuth)
+    for billing instead of an API key. It implements the same chat()/ask()
+    interface as LLMClient so it's a drop-in replacement for scoring,
+    tailoring, cover letters, and extraction.
+
+    Invocation mirrors the pattern already used by the auto-apply launcher:
+    the prompt is piped via stdin and the model is selected with --model.
+    Output is requested as JSON so we can reliably pull the result text and
+    detect errors.
+
+    Notes / limitations:
+      - The CLI has no temperature or max_tokens flags, so those kwargs are
+        accepted for interface compatibility but ignored.
+      - ANTHROPIC_API_KEY is stripped from the subprocess environment so the
+        CLI always uses the interactive subscription login, never an API key.
+    """
+
+    def __init__(self, model: str, binary: str = "claude") -> None:
+        self.model = model
+        self.binary = binary
+
+    # -- prompt assembly ----------------------------------------------------
+
+    @staticmethod
+    def _split_messages(messages: list[dict]) -> tuple[str, str]:
+        """Split OpenAI-style messages into (system_prompt, user_prompt).
+
+        System messages are concatenated and returned separately (passed via
+        --append-system-prompt). Remaining user/assistant turns are flattened
+        into a single stdin prompt, labelled by role when more than one turn
+        is present.
+        """
+        system_parts: list[str] = []
+        convo: list[dict] = []
+        for msg in messages:
+            if msg.get("role") == "system":
+                system_parts.append(msg.get("content", ""))
+            else:
+                convo.append(msg)
+
+        system_prompt = "\n\n".join(p for p in system_parts if p).strip()
+
+        if len(convo) == 1:
+            user_prompt = convo[0].get("content", "")
+        else:
+            lines: list[str] = []
+            for msg in convo:
+                role = msg.get("role", "user").upper()
+                lines.append(f"{role}: {msg.get('content', '')}")
+            user_prompt = "\n\n".join(lines)
+
+        return system_prompt, user_prompt
+
+    # -- subprocess env -----------------------------------------------------
+
+    @staticmethod
+    def _clean_env() -> dict:
+        env = os.environ.copy()
+        # Force subscription (OAuth) auth -- never fall back to API-key billing.
+        env.pop("ANTHROPIC_API_KEY", None)
+        env.pop("ANTHROPIC_AUTH_TOKEN", None)
+        # Avoid nested-session detection when running inside Claude Code itself.
+        env.pop("CLAUDECODE", None)
+        env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+        return env
+
+    # -- public API ---------------------------------------------------------
+
+    def chat(
+        self,
+        messages: list[dict],
+        temperature: float = 0.0,
+        max_tokens: int = 4096,
+    ) -> str:
+        """Send a chat request via the claude CLI and return the response text.
+
+        temperature and max_tokens are ignored (the CLI exposes no such flags)
+        but accepted for interface parity with LLMClient.
+        """
+        system_prompt, user_prompt = self._split_messages(messages)
+
+        cmd = [
+            self.binary,
+            "--model", self.model,
+            "-p",
+            "--output-format", "json",
+            "--no-session-persistence",
+        ]
+        if system_prompt:
+            cmd += ["--append-system-prompt", system_prompt]
+        cmd += ["-"]  # read the user prompt from stdin
+
+        env = self._clean_env()
+
+        last_err: Exception | None = None
+        for attempt in range(_CLAUDE_CLI_MAX_RETRIES):
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    input=user_prompt,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=env,
+                    timeout=_CLAUDE_CLI_TIMEOUT,
+                )
+            except subprocess.TimeoutExpired as exc:
+                last_err = exc
+                if attempt < _CLAUDE_CLI_MAX_RETRIES - 1:
+                    wait = _CLAUDE_CLI_BASE_WAIT * (2 ** attempt)
+                    log.warning("claude CLI timed out, retry %d/%d in %ds",
+                                attempt + 1, _CLAUDE_CLI_MAX_RETRIES, wait)
+                    time.sleep(wait)
+                    continue
+                raise RuntimeError(
+                    f"claude CLI timed out after {_CLAUDE_CLI_TIMEOUT}s"
+                ) from exc
+
+            if proc.returncode != 0:
+                stderr = (proc.stderr or proc.stdout or "").strip()
+                last_err = RuntimeError(f"claude CLI exited {proc.returncode}: {stderr[:300]}")
+                # Retry on transient failures (rate limit / overloaded).
+                if attempt < _CLAUDE_CLI_MAX_RETRIES - 1 and self._is_transient(stderr):
+                    wait = _CLAUDE_CLI_BASE_WAIT * (2 ** attempt)
+                    log.warning("claude CLI transient error, retry %d/%d in %ds: %s",
+                                attempt + 1, _CLAUDE_CLI_MAX_RETRIES, wait, stderr[:150])
+                    time.sleep(wait)
+                    continue
+                raise last_err
+
+            return self._parse_output(proc.stdout)
+
+        raise RuntimeError(f"claude CLI failed after all retries: {last_err}")
+
+    @staticmethod
+    def _is_transient(text: str) -> bool:
+        t = text.lower()
+        return any(k in t for k in ("rate limit", "overloaded", "429", "503", "timeout", "temporarily"))
+
+    @staticmethod
+    def _parse_output(stdout: str) -> str:
+        """Extract the assistant text from `claude -p --output-format json`."""
+        raw = (stdout or "").strip()
+        if not raw:
+            raise RuntimeError("claude CLI returned empty output")
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            # Fall back to treating output as plain text.
+            return raw
+        if isinstance(data, dict):
+            if data.get("is_error"):
+                raise RuntimeError(f"claude CLI reported error: {str(data.get('result'))[:300]}")
+            result = data.get("result")
+            if isinstance(result, str):
+                return result
+        return raw
+
+    def ask(self, prompt: str, **kwargs) -> str:
+        """Convenience: single user prompt -> assistant response."""
+        return self.chat([{"role": "user", "content": prompt}], **kwargs)
+
+    def close(self) -> None:  # noqa: D401 - interface parity, nothing to close
+        """No-op: the CLI client holds no persistent connection."""
+
+
+# ---------------------------------------------------------------------------
 # Singleton
 # ---------------------------------------------------------------------------
 
-_instance: LLMClient | None = None
+_instance: "LLMClient | ClaudeCLIClient | None" = None
 
 
-def get_client() -> LLMClient:
-    """Return (or create) the module-level LLMClient singleton."""
+def _normalize_provider(value: str) -> str:
+    return value.strip().lower().replace("_", "-")
+
+
+def _make_claude_cli_client() -> ClaudeCLIClient:
+    binary = shutil.which("claude")
+    if not binary:
+        raise RuntimeError(
+            "LLM_PROVIDER=claude-cli but the 'claude' CLI was not found on PATH. "
+            "Install Claude Code from https://claude.ai/code and run `claude login`."
+        )
+    model = os.environ.get("LLM_MODEL", "") or "sonnet"
+    return ClaudeCLIClient(model=model, binary=binary)
+
+
+def get_client() -> "LLMClient | ClaudeCLIClient":
+    """Return (or create) the module-level LLM client singleton.
+
+    Honors LLM_PROVIDER=claude-cli to use the Claude Code CLI (subscription
+    auth). Otherwise auto-detects an HTTP provider from the environment.
+    """
     global _instance
     if _instance is None:
-        base_url, model, api_key = _detect_provider()
-        log.info("LLM provider: %s  model: %s", base_url, model)
-        _instance = LLMClient(base_url, model, api_key)
+        provider = _normalize_provider(os.environ.get("LLM_PROVIDER", ""))
+        if provider in ("claude-cli", "claude", "claude-code", "anthropic-cli"):
+            _instance = _make_claude_cli_client()
+            log.info("LLM provider: claude CLI (subscription)  model: %s", _instance.model)
+        else:
+            base_url, model, api_key = _detect_provider()
+            log.info("LLM provider: %s  model: %s", base_url, model)
+            _instance = LLMClient(base_url, model, api_key)
     return _instance

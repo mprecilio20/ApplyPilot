@@ -253,10 +253,14 @@ def _setup_ai_features() -> None:
         console.print("[dim]Discovery-only mode. You can configure AI later with [bold]applypilot init[/bold].[/dim]")
         return
 
-    console.print("Supported providers: [bold]Gemini[/bold] (recommended, free tier), OpenAI, local (Ollama/llama.cpp)")
+    console.print(
+        "Supported providers: [bold]Gemini[/bold] (recommended, free tier), "
+        "[bold]Claude[/bold] (reuse your Anthropic subscription — no API key), "
+        "OpenAI, local (Ollama/llama.cpp)"
+    )
     provider = Prompt.ask(
         "Provider",
-        choices=["gemini", "openai", "local"],
+        choices=["gemini", "claude", "openai", "local"],
         default="gemini",
     )
 
@@ -266,6 +270,23 @@ def _setup_ai_features() -> None:
         api_key = Prompt.ask("Gemini API key (from aistudio.google.com)")
         model = Prompt.ask("Model", default="gemini-2.0-flash")
         env_lines.append(f"GEMINI_API_KEY={api_key}")
+        env_lines.append(f"LLM_MODEL={model}")
+    elif provider == "claude":
+        console.print(
+            "\n[bold cyan]Claude CLI (subscription)[/bold cyan]\n"
+            "Uses the Claude Code CLI with your logged-in Anthropic\n"
+            "subscription (Pro/Max) — no API key, no per-token billing."
+        )
+        if shutil.which("claude"):
+            console.print("[green]Claude Code CLI detected.[/green]")
+        else:
+            console.print(
+                "[yellow]Claude Code CLI not found on PATH.[/yellow]\n"
+                "Install it from: [bold]https://claude.ai/code[/bold]"
+            )
+        console.print("[dim]Make sure you have run [bold]claude login[/bold] at least once.[/dim]")
+        model = Prompt.ask("Model (sonnet / opus / haiku, or a full model name)", default="sonnet")
+        env_lines.append("LLM_PROVIDER=claude-cli")
         env_lines.append(f"LLM_MODEL={model}")
     elif provider == "openai":
         api_key = Prompt.ask("OpenAI API key")

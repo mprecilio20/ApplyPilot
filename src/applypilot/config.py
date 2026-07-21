@@ -197,17 +197,31 @@ TIER_COMMANDS: dict[int, list[str]] = {
 }
 
 
+def _uses_claude_cli_llm() -> bool:
+    """True if the user opted to use the Claude Code CLI as the LLM provider."""
+    provider = os.environ.get("LLM_PROVIDER", "").strip().lower().replace("_", "-")
+    return provider in ("claude-cli", "claude", "claude-code", "anthropic-cli")
+
+
+def _has_llm_provider() -> bool:
+    """True if any LLM provider is configured (HTTP API key or Claude CLI)."""
+    if any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL")):
+        return True
+    if _uses_claude_cli_llm() and shutil.which("claude") is not None:
+        return True
+    return False
+
+
 def get_tier() -> int:
     """Detect the current tier based on available dependencies.
 
     Tier 1 (Discovery):            Python + pip
-    Tier 2 (AI Scoring & Tailoring): + LLM API key
+    Tier 2 (AI Scoring & Tailoring): + LLM provider (API key OR Claude CLI)
     Tier 3 (Full Auto-Apply):       + Claude Code CLI + Chrome
     """
     load_env()
 
-    has_llm = any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL"))
-    if not has_llm:
+    if not _has_llm_provider():
         return 1
 
     has_claude = shutil.which("claude") is not None
@@ -238,8 +252,11 @@ def check_tier(required: int, feature: str) -> None:
     _console = Console(stderr=True)
 
     missing: list[str] = []
-    if required >= 2 and not any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL")):
-        missing.append("LLM API key — run [bold]applypilot init[/bold] or set GEMINI_API_KEY")
+    if required >= 2 and not _has_llm_provider():
+        missing.append(
+            "LLM provider — run [bold]applypilot init[/bold], set GEMINI_API_KEY, "
+            "or set LLM_PROVIDER=claude-cli to use your Anthropic subscription"
+        )
     if required >= 3:
         if not shutil.which("claude"):
             missing.append("Claude Code CLI — install from [bold]https://claude.ai/code[/bold]")
