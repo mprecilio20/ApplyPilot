@@ -8,6 +8,7 @@ search configuration YAML (searches.yaml) rather than being hardcoded.
 """
 
 import logging
+import re
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -115,13 +116,50 @@ def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> 
     return False
 
 
+# -- Company filtering ---------------------------------------------------
+
+def _term_matches(term: str, text: str) -> bool:
+    """Word-boundary match -- avoids 'Intel' matching 'Intellibee' or
+    'Canoe Intelligence', 'Citi' matching 'First Citizens Bank', etc."""
+    return re.search(rf"\b{re.escape(term.lower())}\b", text) is not None
+
+
+def _company_ok(company: str | None, avoid: list[str], keep: list[str] | None = None) -> bool:
+    """Check if a job's employer passes the user's company filters.
+
+    Word-boundary, case-insensitive match. Avoid-list: a job with no captured
+    company name always passes (nothing to avoid). Keep-list (allowlist):
+    if set, a job with no captured company name is filtered out, since it
+    can't be confirmed as one of the approved companies.
+    """
+    if company and avoid:
+        comp = company.lower()
+        if any(_term_matches(a, comp) for a in avoid):
+            return False
+
+    if keep:
+        if not company:
+            return False
+        comp = company.lower()
+        return any(_term_matches(k, comp) for k in keep)
+
+    return True
+
+
 # -- DB storage (JobSpy DataFrame -> SQLite) ---------------------------------
 
-def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tuple[int, int]:
-    """Store JobSpy DataFrame results into the DB. Returns (new, existing)."""
+def store_jobspy_results(
+    conn: sqlite3.Connection, df, source_label: str,
+    avoid_companies: list[str] | None = None,
+    keep_companies: list[str] | None = None,
+) -> tuple[int, int, int]:
+    """Store JobSpy DataFrame results into the DB. Returns (new, existing, filtered)."""
     now = datetime.now(timezone.utc).isoformat()
+    avoid_companies = avoid_companies or []
+    keep_companies = keep_companies or []
     new = 0
     existing = 0
+    filtered = 0
 
     for _, row in df.iterrows():
         url = str(row.get("job_url", ""))
@@ -131,6 +169,10 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
         title = str(row.get("title", "")) if str(row.get("title", "")) != "nan" else None
         company = str(row.get("company", "")) if str(row.get("company", "")) != "nan" else None
         location_str = str(row.get("location", "")) if str(row.get("location", "")) != "nan" else None
+
+        if not _company_ok(company, avoid_companies, keep_companies):
+            filtered += 1
+            continue
 
         # Build salary string from min/max
         salary = None
@@ -168,10 +210,10 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
 
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, "
+                "INSERT INTO jobs (url, title, company, salary, description, location, site, strategy, discovered_at, "
                 "full_description, application_url, detail_scraped_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, title, salary, description, location_str, site_label, strategy, now,
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (url, title, company, salary, description, location_str, site_label, strategy, now,
                  full_description, apply_url, detail_scraped_at),
             )
             new += 1
@@ -179,7 +221,7 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
             existing += 1
 
     conn.commit()
-    return new, existing
+    return new, existing, filtered
 
 
 # -- Single search execution -------------------------------------------------
@@ -195,6 +237,8 @@ def _run_one_search(
     accept_locs: list[str],
     reject_locs: list[str],
     glassdoor_map: dict,
+    avoid_companies: list[str] | None = None,
+    keep_companies: list[str] | None = None,
 ) -> dict:
     """Run a single search query and store results in DB."""
     s = search
@@ -277,11 +321,12 @@ def _run_one_search(
     filtered = before - len(df)
 
     conn = get_connection()
-    new, existing = store_jobspy_results(conn, df, s["query"])
+    new, existing, company_filtered = store_jobspy_results(conn, df, s["query"], avoid_companies, keep_companies)
+    filtered += company_filtered
 
     msg = f"[{label}] {before} results -> {new} new, {existing} dupes"
     if filtered:
-        msg += f", {filtered} filtered (location)"
+        msg += f", {filtered} filtered (location/company)"
     log.info(msg)
 
     return {"new": new, "existing": existing, "errors": 0, "filtered": filtered, "total": before, "label": label}
@@ -345,7 +390,7 @@ def search_jobs(
             log.info("  %s: %d", site, count)
 
     conn = init_db()
-    new, existing = store_jobspy_results(conn, df, query)
+    new, existing, _filtered = store_jobspy_results(conn, df, query)
     log.info("Stored: %d new, %d already in DB", new, existing)
 
     db_total = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
@@ -377,6 +422,11 @@ def _full_crawl(
     defaults = search_cfg.get("defaults", {})
     glassdoor_map = search_cfg.get("glassdoor_location_map", {})
     accept_locs, reject_locs = _load_location_config(search_cfg)
+    avoid_companies = search_cfg.get("avoid_companies", [])
+    # keep_companies is intentionally NOT applied here -- only avoid_companies
+    # auto-filters during discovery. keep_companies stays in searches.yaml as
+    # reference data only.
+    keep_companies: list[str] = []
 
     if tiers:
         queries = [q for q in queries if q.get("tier") in tiers]
@@ -412,6 +462,7 @@ def _full_crawl(
             s, sites, results_per_site, hours_old,
             proxy_config, defaults, max_retries,
             accept_locs, reject_locs, glassdoor_map,
+            avoid_companies, keep_companies,
         )
         completed += 1
         total_new += result["new"]

@@ -171,9 +171,17 @@ def _build_screening_section(profile: dict) -> str:
     target_role = exp.get("target_role", personal.get("current_job_title", "software engineer"))
     work_auth = profile["work_authorization"]
 
+    if personal.get("willing_to_relocate"):
+        targets = personal.get("relocation_targets", "").strip()
+        relocation_line = (
+            f"open to relocating to: {targets}" if targets else "open to relocating anywhere"
+        )
+    else:
+        relocation_line = "cannot relocate"
+
     return f"""== SCREENING QUESTIONS (be strategic) ==
 Hard facts -> answer truthfully from the profile. No guessing. This includes:
-  - Location/relocation: lives in {city}, cannot relocate
+  - Location/relocation: lives in {city}, {relocation_line}
   - Work authorization: {work_auth.get('legally_authorized_to_work', 'see profile')}
   - Citizenship, clearance, licenses, certifications: answer from profile only
   - Criminal/background: answer from profile only

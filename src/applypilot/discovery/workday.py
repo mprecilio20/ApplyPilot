@@ -326,10 +326,10 @@ def store_results(conn: sqlite3.Connection, jobs: list[dict], employers: dict) -
 
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, "
+                "INSERT INTO jobs (url, title, company, salary, description, location, site, strategy, "
                 "discovered_at, full_description, application_url, detail_scraped_at, detail_error) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, job.get("title"), None, short_desc, job.get("location"),
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (url, job.get("title"), site, None, short_desc, job.get("location"),
                  site, strategy, now, full_description, url, detail_scraped_at, detail_error),
             )
             new += 1
@@ -493,6 +493,26 @@ def run_workday_discovery(employers: dict | None = None, workers: int = 1) -> di
     search_cfg = config.load_search_config()
     queries_cfg = search_cfg.get("queries", [])
     accept_locs, reject_locs = _load_location_filter(search_cfg)
+
+    def _term_matches(term: str, text: str) -> bool:
+        return re.search(rf"\b{re.escape(term)}\b", text) is not None
+
+    # Drop avoided employers entirely -- no point scraping companies the
+    # user never wants to apply to.
+    avoid_companies = [a.lower() for a in search_cfg.get("avoid_companies", [])]
+    if avoid_companies:
+        before_count = len(employers)
+        employers = {
+            key: emp for key, emp in employers.items()
+            if not any(_term_matches(a, emp.get("name", "").lower()) for a in avoid_companies)
+        }
+        skipped = before_count - len(employers)
+        if skipped:
+            log.info("Skipping %d avoided employer(s)", skipped)
+
+    # keep_companies is intentionally NOT applied here -- only avoid_companies
+    # auto-filters employers. keep_companies stays in searches.yaml as
+    # reference data only.
 
     # Default to tier 1-2 queries for workday scraping
     max_tier = search_cfg.get("workday_max_tier", 2)

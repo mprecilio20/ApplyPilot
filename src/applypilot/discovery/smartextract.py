@@ -85,6 +85,25 @@ def load_sites() -> list[dict]:
     return data.get("sites", [])
 
 
+def _term_matches(term: str, text: str) -> bool:
+    """Word-boundary match -- avoids 'Intel' matching 'Intellibee', etc."""
+    return re.search(rf"\b{re.escape(term.lower())}\b", text) is not None
+
+
+def _company_ok(company: str | None, avoid: list[str], keep: list[str] | None = None) -> bool:
+    """Check if a job's employer passes the user's company filters."""
+    if company and avoid:
+        comp = company.lower()
+        if any(_term_matches(a, comp) for a in avoid):
+            return False
+    if keep:
+        if not company:
+            return False
+        comp = company.lower()
+        return any(_term_matches(k, comp) for k in keep)
+    return True
+
+
 def _store_jobs_filtered(
     conn: sqlite3.Connection,
     jobs: list[dict],
@@ -92,9 +111,13 @@ def _store_jobs_filtered(
     strategy: str,
     accept_locs: list[str],
     reject_locs: list[str],
+    avoid_companies: list[str] | None = None,
+    keep_companies: list[str] | None = None,
 ) -> tuple[int, int]:
     """Store jobs with location filtering. Returns (new, existing)."""
     now = datetime.now(timezone.utc).isoformat()
+    avoid_companies = avoid_companies or []
+    keep_companies = keep_companies or []
     new = 0
     existing = 0
     filtered = 0
@@ -106,11 +129,14 @@ def _store_jobs_filtered(
         if not _location_ok(job.get("location"), accept_locs, reject_locs):
             filtered += 1
             continue
+        if not _company_ok(job.get("company"), avoid_companies, keep_companies):
+            filtered += 1
+            continue
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, job.get("title"), job.get("salary"), job.get("description"),
+                "INSERT INTO jobs (url, title, company, salary, description, location, site, strategy, discovered_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (url, job.get("title"), job.get("company"), job.get("salary"), job.get("description"),
                  job.get("location"), site, strategy, now),
             )
             new += 1
@@ -118,7 +144,7 @@ def _store_jobs_filtered(
             existing += 1
 
     if filtered:
-        log.info("Filtered %d jobs (wrong location)", filtered)
+        log.info("Filtered %d jobs (location/company)", filtered)
     conn.commit()
     return new, existing
 
@@ -1017,6 +1043,8 @@ def _run_all(
     accept_locs: list[str],
     reject_locs: list[str],
     workers: int = 1,
+    avoid_companies: list[str] | None = None,
+    keep_companies: list[str] | None = None,
 ) -> dict:
     """Run smart extract on all targets.
 
@@ -1038,7 +1066,8 @@ def _run_all(
         if jobs:
             new, existing = _store_jobs_filtered(conn, jobs, target["name"],
                                                   r.get("strategy", "?"),
-                                                  accept_locs, reject_locs)
+                                                  accept_locs, reject_locs,
+                                                  avoid_companies, keep_companies)
             total_new += new
             total_existing += existing
             log.info("DB: +%d new, %d already existed", new, existing)
@@ -1103,6 +1132,11 @@ def run_smart_extract(
     """
     search_cfg = config.load_search_config()
     accept_locs, reject_locs = _load_location_filter(search_cfg)
+    avoid_companies = search_cfg.get("avoid_companies", [])
+    # keep_companies is intentionally NOT applied here -- only avoid_companies
+    # auto-filters during discovery. keep_companies stays in searches.yaml as
+    # reference data only.
+    keep_companies: list[str] = []
 
     targets = build_scrape_targets(sites=sites, search_cfg=search_cfg)
 
@@ -1115,4 +1149,5 @@ def run_smart_extract(
     log.info("Sites: %d searchable, %d static | Total targets: %d (workers=%d)",
              search_sites, static_sites, len(targets), workers)
 
-    return _run_all(targets, accept_locs, reject_locs, workers=workers)
+    return _run_all(targets, accept_locs, reject_locs, workers=workers,
+                     avoid_companies=avoid_companies, keep_companies=keep_companies)

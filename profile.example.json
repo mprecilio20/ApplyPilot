@@ -10,6 +10,8 @@
     "province_state": "Your State/Province",
     "country": "Your Country",
     "postal_code": "A1B 2C3",
+    "willing_to_relocate": false,
+    "relocation_targets": "City A, City B",
     "linkedin_url": "https://www.linkedin.com/in/yourprofile",
     "github_url": "https://github.com/yourusername",
     "portfolio_url": "",

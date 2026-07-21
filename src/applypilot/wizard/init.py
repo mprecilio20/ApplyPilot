@@ -87,6 +87,12 @@ def _setup_profile() -> dict:
     # -- Personal --
     console.print("\n[bold cyan]Personal Information[/bold cyan]")
     full_name = Prompt.ask("Full name")
+    willing_to_relocate = Confirm.ask("Willing to relocate?", default=False)
+    relocation_targets = (
+        Prompt.ask("Where? (comma-separated cities, blank = anywhere)", default="")
+        if willing_to_relocate
+        else ""
+    )
     profile["personal"] = {
         "full_name": full_name,
         "preferred_name": Prompt.ask("Preferred/nickname (leave blank to use first name)", default=""),
@@ -97,6 +103,8 @@ def _setup_profile() -> dict:
         "country": Prompt.ask("Country"),
         "postal_code": Prompt.ask("Postal/ZIP code", default=""),
         "address": Prompt.ask("Street address (optional, used for form auto-fill)", default=""),
+        "willing_to_relocate": willing_to_relocate,
+        "relocation_targets": relocation_targets,
         "linkedin_url": Prompt.ask("LinkedIn URL", default=""),
         "github_url": Prompt.ask("GitHub URL (optional)", default=""),
         "portfolio_url": Prompt.ask("Portfolio URL (optional)", default=""),
