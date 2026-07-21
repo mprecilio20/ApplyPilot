@@ -5,6 +5,7 @@ job description. All personal data is loaded at runtime from the user's
 profile and resume file.
 """
 
+import concurrent.futures
 import json
 import logging
 import re
@@ -101,12 +102,14 @@ def score_job(resume_text: str, job: dict) -> dict:
         return {"score": 0, "keywords": "", "reasoning": f"LLM error: {e}"}
 
 
-def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
+def run_scoring(limit: int = 0, rescore: bool = False, workers: int = 1) -> dict:
     """Score unscored jobs that have full descriptions.
 
     Args:
         limit: Maximum number of jobs to score in this run.
         rescore: If True, re-score all jobs (not just unscored ones).
+        workers: Number of jobs to score concurrently (LLM calls are
+                 network/subprocess-bound, so this parallelizes well).
 
     Returns:
         {"scored": int, "errors": int, "elapsed": float, "distribution": list}
@@ -131,35 +134,39 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
         columns = jobs[0].keys()
         jobs = [dict(zip(columns, row)) for row in jobs]
 
-    log.info("Scoring %d jobs sequentially...", len(jobs))
+    log.info("Scoring %d jobs (%d worker%s)...", len(jobs), workers, "" if workers == 1 else "s")
     t0 = time.time()
     completed = 0
     errors = 0
     results: list[dict] = []
 
-    for job in jobs:
-        result = score_job(resume_text, job)
-        result["url"] = job["url"]
-        completed += 1
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+        future_to_job = {executor.submit(score_job, resume_text, job): job for job in jobs}
 
-        if result["score"] == 0:
-            errors += 1
+        for future in concurrent.futures.as_completed(future_to_job):
+            job = future_to_job[future]
+            result = future.result()
+            result["url"] = job["url"]
+            completed += 1
 
-        results.append(result)
+            if result["score"] == 0:
+                errors += 1
 
-        # Commit immediately -- if the process crashes or is interrupted,
-        # already-scored jobs are safely persisted and won't be re-scored.
-        now = datetime.now(timezone.utc).isoformat()
-        conn.execute(
-            "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
-            (result["score"], f"{result['keywords']}\n{result['reasoning']}", now, result["url"]),
-        )
-        conn.commit()
+            results.append(result)
 
-        log.info(
-            "[%d/%d] score=%d  %s",
-            completed, len(jobs), result["score"], job.get("title", "?")[:60],
-        )
+            # Commit immediately -- if the process crashes or is interrupted,
+            # already-scored jobs are safely persisted and won't be re-scored.
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
+                (result["score"], f"{result['keywords']}\n{result['reasoning']}", now, result["url"]),
+            )
+            conn.commit()
+
+            log.info(
+                "[%d/%d] score=%d  %s",
+                completed, len(jobs), result["score"], job.get("title", "?")[:60],
+            )
 
     elapsed = time.time() - t0
     log.info("Done: %d scored in %.1fs (%.1f jobs/sec)", len(results), elapsed, len(results) / elapsed if elapsed > 0 else 0)
